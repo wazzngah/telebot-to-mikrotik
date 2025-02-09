@@ -2,8 +2,8 @@ import os
 import logging
 import routeros_api
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, CallbackContext
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, CallbackContext, MessageHandler, filters
 
 # Load konfigurasi dari config.env
 load_dotenv("config.env")
@@ -21,7 +21,7 @@ AUTHORIZED_CHAT_IDS = [
     int(chat_id) for chat_id in raw_chat_ids.split(",") if chat_id.strip().isdigit()
 ]
 
-# Setup Logging untuk Debugging
+# Setup Logging
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -32,25 +32,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Debugging: Log daftar Chat ID yang diizinkan saat bot dijalankan
-logger.info(f"TELEGRAM_CHATID yang terbaca: {raw_chat_ids}")
 logger.info(f"Chat ID yang diizinkan: {AUTHORIZED_CHAT_IDS}")
 
-# Fungsi untuk memeriksa apakah user diizinkan
 def is_authorized(update: Update) -> bool:
     chat_id = update.message.chat_id if update.message else update.callback_query.message.chat_id
-    logger.info(f"Chat ID {chat_id} mencoba mengakses bot.")
+    return chat_id in AUTHORIZED_CHAT_IDS
 
-    if chat_id in AUTHORIZED_CHAT_IDS:
-        logger.info(f"Chat ID {chat_id} diizinkan.")
-        return True
-    else:
-        logger.warning(f"Chat ID {chat_id} DITOLAK!")
-        return False
-
-# Fungsi untuk mengambil daftar user PPPoE dari MikroTik
-def get_pppoe_users():
-    logger.info("Mengambil daftar user PPPoE dari MikroTik...")
+def get_pppoe_stats():
     try:
         connection = routeros_api.RouterOsApiPool(
             MIKROTIK_IP,
@@ -61,67 +49,138 @@ def get_pppoe_users():
         )
         api = connection.get_api()
         users = api.get_resource('/ppp/secret').get()
+        active_users = api.get_resource('/ppp/active').get()
         connection.disconnect()
 
-        logger.info("Berhasil mengambil daftar user PPPoE.")
-        if not users:
-            return "❌ Tidak ada user PPPoE yang terdaftar."
+        total_users = len(users)
+        online_users = len(active_users)
+        offline_users = total_users - online_users
 
-        user_list = "\n".join([f"{user['name']} - {user.get('profile', 'No Profile')}" for user in users])
-        return f"📋 Daftar User PPPoE:\n{user_list}"
+        return f"\n📊 Statistik User PPPoE:\n🔹 Online: {online_users}\n🔻 Offline: {offline_users}\n📌 Total: {total_users}"
     except Exception as e:
-        logger.error(f"Error saat mengambil user PPPoE: {str(e)}")
+        logger.error(f"Error mengambil statistik PPPoE: {str(e)}")
         return f"⚠️ Error: {str(e)}"
 
-# Fungsi untuk menampilkan menu dengan tombol
-async def start(update: Update, context: CallbackContext) -> None:
-    chat_id = update.message.chat_id
-    logger.info(f"Perintah /start diterima dari Chat ID {chat_id}")
+def get_profiles():
+    try:
+        connection = routeros_api.RouterOsApiPool(
+            MIKROTIK_IP,
+            username=MIKROTIK_USER,
+            password=MIKROTIK_PASS,
+            port=MIKROTIK_PORT,
+            plaintext_login=True
+        )
+        api = connection.get_api()
+        profiles = api.get_resource('/ppp/profile').get()
+        connection.disconnect()
+        return [profile['name'] for profile in profiles]
+    except Exception as e:
+        logger.error(f"Error mengambil daftar profil: {str(e)}")
+        return []
 
+async def start(update: Update, context: CallbackContext) -> None:
     if not is_authorized(update):
         await update.message.reply_text("🚫 Anda tidak memiliki izin untuk menggunakan bot ini.")
-        logger.warning(f"Chat ID {chat_id} ditolak akses!")
         return
-
-    keyboard = [[InlineKeyboardButton("🔍 Cek User PPPoE", callback_data="cekuser")]]
+    keyboard = [
+        [InlineKeyboardButton("📊 Cek Statistik User", callback_data="cekstats")],
+        [InlineKeyboardButton("➕ Tambah User", callback_data="tambahuser")]
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("📌 Pilih menu di bawah:", reply_markup=reply_markup)
 
-# Fungsi untuk menangani tombol
 async def button_handler(update: Update, context: CallbackContext) -> None:
     query = update.callback_query
-    chat_id = query.message.chat_id
-    logger.info(f"Tombol diklik oleh Chat ID {chat_id} dengan data: {query.data}")
-
     if not is_authorized(update):
         await query.answer("🚫 Anda tidak memiliki izin untuk menggunakan bot ini.", show_alert=True)
-        logger.warning(f"Chat ID {chat_id} ditolak akses!")
         return
-
     await query.answer()
-    if query.data == "cekuser":
-        user_list = get_pppoe_users()
-        await query.message.reply_text(user_list)
+    if query.data == "cekstats":
+        stats = get_pppoe_stats()
+        await query.message.reply_text(stats)
+    elif query.data == "tambahuser":
+        await query.message.reply_text("📝 Masukkan username untuk user baru:")
+        context.user_data['step'] = 'username'
 
-# Main Program
-def main():
-    if not TELEGRAM_BOT_TOKEN:
-        logger.error("❌ TELEGRAM_BOT_TOKEN belum dikonfigurasi di config.env")
+async def message_handler(update: Update, context: CallbackContext) -> None:
+    if not is_authorized(update):
+        await update.message.reply_text("🚫 Anda tidak memiliki izin untuk menggunakan bot ini.")
         return
+    step = context.user_data.get('step')
+    if step == 'username':
+        context.user_data['username'] = update.message.text
+        await update.message.reply_text("🔑 Masukkan password untuk user baru:")
+        context.user_data['step'] = 'password'
+    elif step == 'password':
+        context.user_data['password'] = update.message.text
+        profiles = get_profiles()
+        if not profiles:
+            await update.message.reply_text("⚠️ Gagal mengambil daftar profil.")
+            return
+        keyboard = [[InlineKeyboardButton(profile, callback_data=f"profile_{profile}")] for profile in profiles]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("📜 Pilih profil:", reply_markup=reply_markup)
+        context.user_data['step'] = 'profile'
+    elif step == 'confirm':
+        if update.message.text.lower() == 'ya':
+            try:
+                connection = routeros_api.RouterOsApiPool(
+                    MIKROTIK_IP, username=MIKROTIK_USER, password=MIKROTIK_PASS, port=MIKROTIK_PORT, plaintext_login=True
+                )
+                api = connection.get_api()
+                api.get_resource('/ppp/secret').add(
+                    name=context.user_data['username'],
+                    password=context.user_data['password'],
+                    profile=context.user_data['profile'],
+                    service="pppoe"
+                )
+                connection.disconnect()
+                await update.message.reply_text("✅ User berhasil ditambahkan!")
+            except Exception as e:
+                logger.error(f"Error menambahkan user: {str(e)}")
+                await update.message.reply_text(f"⚠️ Gagal menambahkan user: {str(e)}")
+        else:
+            await update.message.reply_text("❌ Proses dibatalkan.")
+        context.user_data.clear()
 
-    logger.info("🚀 Memulai bot Telegram...")
+async def profile_handler(update: Update, context: CallbackContext) -> None:
+    query = update.callback_query
+    profile_selected = query.data.replace("profile_", "")
 
-    if not AUTHORIZED_CHAT_IDS:
-        logger.warning("⚠️ AUTHORIZED_CHAT_IDS kosong atau tidak diatur dengan benar!")
+    # ✅ Tambahkan log untuk debugging
+    logger.info(f"Profil dipilih: {profile_selected}")
+    
+    context.user_data['profile'] = profile_selected
 
+    # ✅ Pastikan query dijawab agar tidak ada timeout dari Telegram
+    await query.answer("Profil dipilih!")
+
+    # ✅ Kirim konfirmasi ke user
+    username = context.user_data.get('username', 'N/A')
+    password = context.user_data.get('password', 'N/A')
+    
+    text_konfirmasi = (
+        f"⚡ Konfirmasi penambahan user:\n"
+        f"👤 Username: {username}\n"
+        f"🔑 Password: {password}\n"
+        f"📜 Profile: {profile_selected}\n\n"
+        f"Ketik *ya* untuk konfirmasi, atau *tidak* untuk batal."
+    )
+
+    await query.message.reply_text(text_konfirmasi, parse_mode="Markdown")
+    context.user_data['step'] = 'confirm'
+
+
+def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Tambahkan command handler
-    app.add_handler(CommandHandler("start", start))
+    # ✅ Pastikan `profile_handler` ditangani duluan sebelum `button_handler`
+    app.add_handler(CallbackQueryHandler(profile_handler, pattern=r"^profile_.*"))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # Mulai bot
-    logger.info("✅ Bot sedang berjalan...")
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+
     app.run_polling()
 
 if __name__ == '__main__':
